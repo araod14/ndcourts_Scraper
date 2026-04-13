@@ -28,3 +28,9 @@ results_*.csv
 .vscode/
 .idea/
 .DS_Store
+
+# Assets and Generated Pages
+*.jpg
+*.css
+*.js
+*.html
