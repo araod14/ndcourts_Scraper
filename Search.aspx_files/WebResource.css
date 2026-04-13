@@ -1,0 +1,64 @@
+#LBD_CaptchaDiv {
+  margin: 0;
+  padding: 0;
+}
+
+*html #LBD_CaptchaDiv {
+  margin-bottom: -3px;
+  overflow: visible;
+}
+
+#LBD_CaptchaDiv #LBD_CaptchaImage
+{
+  float: left;
+  margin: 0;
+  padding: 0;
+}
+
+#LBD_CaptchaDiv #LBD_CaptchaIcons 
+{
+  width: 22px;
+  float: right;
+  text-align: left;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+#LBD_CaptchaDiv #LBD_CaptchaIcons a
+{
+  margin: 0;
+  padding: 0;
+  display: block;
+  background-color: transparent;
+  text-decoration: none;
+  border: none;
+}
+
+#LBD_CaptchaDiv #LBD_CaptchaIcons a:focus, #LBD_CaptchaDiv #LBD_CaptchaIcons a:active
+{
+  border: none !important;
+  -moz-outline:none;
+}
+
+#LBD_CaptchaDiv #LBD_CaptchaIcons a img
+{
+  border: 0;
+  margin: 0;
+  padding: 0;
+  padding-top: 1px;
+  padding-bottom: 4px;
+  display: block;
+}
+
+#LBD_CaptchaDiv .LBD_placeholder
+{
+  visibility: hidden; 
+  width:0 !important; 
+  height:0 !important;
+}
+
+*html #LBD_CaptchaDiv .LBD_placeholder
+{
+  display: none !important; 
+}

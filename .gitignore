@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# Logs
+*.log
+ndcourts.log
+
+# Playwright & Debug
+debug_screenshots/
+.playwright-mcp/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Project specific results
+results_*.csv
+.~lock.*#
+
+# IDEs & Tools
+.claude/
+.vscode/
+.idea/
+.DS_Store
