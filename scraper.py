@@ -11,7 +11,9 @@ import base64
 import logging
 import os
 import random
+import re
 import time
+from urllib.parse import urljoin
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import Optional, Literal
 
 import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page, BrowserContext, ConsoleMessage
 
@@ -962,6 +965,119 @@ class NDCourtsScraper:
         await page.screenshot(path=str(path), full_page=True)
         self._log.debug("Screenshot guardado → %s", path)
 
+    # ------------------------------------------------------------------
+    # Detail-page helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_name(full_name: str) -> tuple[str, str]:
+        """'Jensen, Michael Lee' → (last='Jensen', first='Michael Lee')."""
+        if "," in full_name:
+            last, _, first = full_name.partition(",")
+            return last.strip(), first.strip()
+        parts = full_name.split()
+        return (parts[-1] if parts else ""), " ".join(parts[:-1])
+
+    @staticmethod
+    def _format_charges(charges: list[str]) -> str:
+        if not charges:
+            return ""
+        if len(charges) == 1:
+            return charges[0]
+        if len(charges) == 2:
+            return f"{charges[0]} and {charges[1]}"
+        return ", ".join(charges[:-1]) + f", and {charges[-1]}"
+
+    @staticmethod
+    def _parse_address(raw: str) -> tuple[str, str, str, str]:
+        """
+        Parse an address blob into (street, city, state, zip).
+        Handles 'Cameron, WI 54822' or '123 Main St\\nCameron, WI 54822'.
+        """
+        lines = [l.strip() for l in raw.replace("\xa0", " ").strip().split("\n") if l.strip()]
+        if not lines:
+            return "", "", "", ""
+        last = lines[-1]
+        street = ", ".join(lines[:-1])
+        m = re.match(r"^(.+),\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", last)
+        if m:
+            return street, m.group(1).strip(), m.group(2), m.group(3)
+        m2 = re.match(r"^(.+),\s+([A-Z]{2})\s*$", last)
+        if m2:
+            return street, m2.group(1).strip(), m2.group(2), ""
+        return "", last, "", ""
+
+    @staticmethod
+    def _parse_detail_html(html: str) -> dict:
+        """
+        Parse a CaseDetail.aspx page and return a dict with:
+          address, city, state, zip_code, attorney, charges_list
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        out = {"address": "", "city": "", "state": "", "zip_code": "", "attorney": "", "charges_list": []}
+
+        # -- Party Information -------------------------------------------------
+        for caption_div in soup.find_all("div", class_="ssCaseDetailSectionTitle"):
+            if "Party Information" not in caption_div.text:
+                continue
+            party_table = caption_div.find_parent("table")
+            if not party_table:
+                break
+
+            # Identify the Defendant row id (e.g. "PIr01")
+            defendant_id = None
+            for th in party_table.find_all("th"):
+                if th.get_text(strip=True) == "Defendant":
+                    defendant_id = th.get("id")
+                    break
+
+            if defendant_id:
+                for td in party_table.find_all("td"):
+                    hdrs = td.get("headers") or []
+                    if isinstance(hdrs, str):
+                        hdrs = hdrs.split()
+                    if defendant_id not in hdrs:
+                        continue
+                    raw = td.get_text(separator="\n", strip=True)
+                    if "PIc5" in hdrs:
+                        out["attorney"] = raw
+                    elif not re.search(r"Male|Female|DOB:", raw) and raw:
+                        street, city, state, zip_code = NDCourtsScraper._parse_address(raw)
+                        out.update({"address": street, "city": city, "state": state, "zip_code": zip_code})
+            break
+
+        # -- Charge Information ------------------------------------------------
+        for caption_div in soup.find_all("div", class_="ssCaseDetailSectionTitle"):
+            if "Charge Information" not in caption_div.text:
+                continue
+            charge_table = caption_div.find_parent("table")
+            if not charge_table:
+                break
+            charges = []
+            for row in charge_table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) >= 2 and re.match(r"^\d+\.$", cells[0].get_text(strip=True)):
+                    name = cells[1].get_text(strip=True)
+                    if name:
+                        charges.append(name)
+            out["charges_list"] = charges
+            break
+
+        return out
+
+    async def _fetch_detail(self, page: Page, url: str) -> dict:
+        """
+        Fetch a CaseDetail.aspx page using the active browser session
+        (inherits cookies) and return parsed detail fields.
+        """
+        try:
+            resp = await page.request.get(url)
+            html = await resp.text()
+            return self._parse_detail_html(html)
+        except Exception as exc:
+            self._log.warning("No se pudo obtener el detalle de %s: %s", url, exc)
+            return {"address": "", "city": "", "state": "", "zip_code": "", "attorney": "", "charges_list": []}
+
     async def _parse_results(self, page: Page) -> list[dict]:
         """
         Extrae los resultados de la tabla de casos.
@@ -1018,18 +1134,17 @@ class NDCourtsScraper:
             if len(cells) < 5:
                 continue
 
-            # Columna 0: case number (texto del enlace)
+            # Columna 0: case number + detail URL
             case_link = await cells[0].query_selector("a")
             case_number = (await case_link.inner_text()).strip() if case_link else ""
+            detail_url = await case_link.get_attribute("href") if case_link else ""
+            if detail_url and not detail_url.startswith("http"):
+                detail_url = urljoin(page.url, detail_url)
 
-            # Columna 1: citation numbers (puede haber varios)
-            citation_divs = await _divs(cells[1])
-            citation = "; ".join(v for v in citation_divs if v and v != "0")
-
-            # Columna 2: defendant name + birth year
+            # Columna 2: defendant name → split into first / last
             def_divs = await _divs(cells[2])
-            defendant_name = def_divs[0] if len(def_divs) > 0 else ""
-            birth_year     = def_divs[1] if len(def_divs) > 1 else ""
+            defendant_name = def_divs[0] if def_divs else ""
+            last_name, first_name = self._split_name(defendant_name)
 
             # Columna 3: filed date + county + judicial officer
             loc_divs  = await _divs(cells[3])
@@ -1042,26 +1157,39 @@ class NDCourtsScraper:
             case_type = type_divs[0] if len(type_divs) > 0 else ""
             status    = type_divs[1] if len(type_divs) > 1 else ""
 
-            # Columna 5: charges (tabla anidada → unir con "; ")
-            charge_tds = await cells[5].query_selector_all("td") if len(cells) > 5 else []
-            charge_texts = []
-            for td in charge_tds:
-                txt = (await td.inner_text()).strip()
-                if txt:
-                    charge_texts.append(txt)
-            charges = "; ".join(charge_texts)
+            # Fetch CaseDetail page for address, attorney, and detailed charges
+            detail = await self._fetch_detail(page, detail_url) if detail_url else {
+                "address": "", "city": "", "state": "", "zip_code": "",
+                "attorney": "", "charges_list": [],
+            }
+
+            # Use charges from detail page (preferred); fall back to search-table column
+            if detail["charges_list"]:
+                charges = self._format_charges(detail["charges_list"])
+            else:
+                charge_tds = await cells[5].query_selector_all("td") if len(cells) > 5 else []
+                raw_charges = [
+                    (await td.inner_text()).strip()
+                    for td in charge_tds
+                    if (await td.inner_text()).strip()
+                ]
+                charges = self._format_charges(raw_charges)
 
             results.append({
-                "case_number":    case_number,
-                "filed_date":     filed_date,
-                "county":         county,
-                "judge":          judge,
-                "case_type":      case_type,
-                "status":         status,
-                "defendant_name": defendant_name,
-                "birth_year":     birth_year,
-                "citation":       citation,
-                "charges":        charges,
+                "Case Number":       case_number,
+                "First Name":        first_name,
+                "Last Name":         last_name,
+                "Filed Date":        filed_date,
+                "Location":          county,
+                "Judicial Officer":  judge,
+                "Case Type":         case_type,
+                "Case Status":       status,
+                "Address":           detail["address"],
+                "City":              detail["city"],
+                "State":             detail["state"],
+                "Zip Code":          detail["zip_code"],
+                "Attorney":          detail["attorney"],
+                "Charges":           charges,
             })
 
         return results
