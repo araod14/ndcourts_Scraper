@@ -613,6 +613,12 @@ class NDCourtsScraper:
         self.headless = headless
         self.proxy    = proxy
         self._log     = logging.getLogger("ndcourts.scraper")
+        if proxy:
+            server = proxy.get("server", "")
+            user   = proxy.get("username", "")
+            self._log.info("Proxy habilitado — server=%s user=%s", server, user or "(sin auth)")
+        else:
+            self._log.info("Proxy deshabilitado — conexión directa")
 
     # ------------------------------------------------------------------
     # Configuración del browser con anti-detección
