@@ -31,6 +31,8 @@ results_*.csv
 
 # Assets and Generated Pages
 *.jpg
+*.png
+*.gif
 *.css
 *.js
 *.html
