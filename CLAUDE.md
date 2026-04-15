@@ -39,6 +39,7 @@ Single-file scraper (`scraper.py`) targeting `https://publicsearch.ndcourts.gov/
 - `TwoCaptchaClient(api_key, provider)` — implements 2captcha and SolveCaptcha (same API, different base URLs)
 - `CapSolverClient(api_key)` — implements CapSolver's native API (`api.capsolver.com`)
 - `create_captcha_solver(provider, api_key)` — factory function; returns the right solver instance
+- `_LocalProxyServer` — local HTTP proxy (127.0.0.1) that pre-embeds upstream credentials; started automatically by `_build_context()` when a proxy is configured
 - `NDCourtsScraper` — main orchestrator; accepts `provider`, `api_key`, optional `proxy` and `solver`
 
 **Choosing a CAPTCHA provider:**
@@ -68,6 +69,17 @@ NDCourtsScraper(api_key="", solver=my_custom_solver)
 - Init script injects only `window.chrome` — canvas/WebGL/platform overrides are intentionally omitted (they break Cloudflare Turnstile by creating fingerprint inconsistencies)
 - Launch arg `--disable-blink-features=AutomationControlled`
 - Randomized User-Agent, viewport, `_human_type()` (per-character delays), `_human_click()` (multi-step mouse movement)
+
+**Proxy configuration (`.env`):**
+```
+PROXY_SERVER=http://p.webshare.io:80
+PROXY_USERNAME=your_username
+PROXY_PASSWORD=your_password
+```
+- Requires **residential proxies** — datacenter IPs are hard-blocked by Cloudflare on this site
+- `publicsearch.ndcourts.gov` is a `.gov` domain; IProyal requires $500 spend to unlock `.gov` on residential plans
+- Webshare Rotating Residential (`p.webshare.io:80`) confirmed working
+- Chromium does not support the two-step proxy auth handshake (CONNECT → 407 → retry) used by some providers; `_LocalProxyServer` solves this by running a local proxy on `127.0.0.1` that pre-embeds the upstream credentials — Chromium connects to localhost without auth, and the local proxy forwards with auth to the upstream
 
 ## Target site details
 
