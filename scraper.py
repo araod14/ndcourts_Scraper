@@ -1637,8 +1637,57 @@ class NDCourtsScraper:
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de exportación
+# Utilidades de exportación y notificación
 # ---------------------------------------------------------------------------
+
+def send_email_with_csv(filepath: Path, row_count: int) -> None:
+    """
+    Envía el CSV como adjunto usando la API REST de Resend.
+    Lee configuración desde variables de entorno:
+      EMAIL_TO, EMAIL_FROM, RESEND_API_KEY
+    Si EMAIL_TO o RESEND_API_KEY no están configurados, no hace nada.
+    """
+    to_addr  = os.getenv("EMAIL_TO", "")
+    from_addr= os.getenv("EMAIL_FROM", "onboarding@resend.dev")
+    api_key  = os.getenv("RESEND_API_KEY", "")
+
+    if not to_addr or not api_key:
+        log.debug("EMAIL_TO o RESEND_API_KEY no configurados — omitiendo envío de correo.")
+        return
+
+    filepath = Path(filepath)
+    if not filepath.exists():
+        log.warning("CSV no encontrado en %s — correo no enviado.", filepath)
+        return
+
+    content_b64 = base64.b64encode(filepath.read_bytes()).decode()
+
+    payload = {
+        "from":    from_addr,
+        "to":      [to_addr],
+        "subject": f"ND Courts — {row_count} resultados ({filepath.name})",
+        "text":    (
+            f"Se adjunta el CSV con {row_count} resultado(s) "
+            f"generado por el scraper de ND Courts.\n\n"
+            f"Archivo: {filepath.name}\n"
+            f"Filas: {row_count}\n"
+        ),
+        "attachments": [{"filename": filepath.name, "content": content_b64}],
+    }
+
+    try:
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Correo enviado a %s con adjunto %s (id=%s)",
+                 to_addr, filepath.name, resp.json().get("id", "?"))
+    except Exception as exc:
+        log.error("Error enviando correo: %s", exc)
+
 
 def save_to_csv(results: list[dict], filepath) -> None:
     """Guarda la lista de resultados en un archivo CSV."""
@@ -1704,7 +1753,9 @@ async def main():
     )
 
     results = await scraper.search_by_date(params)
-    save_to_csv(results, "results_misdemeanor_2025-2026.csv")
+    csv_path = Path("results_misdemeanor_2025-2026.csv")
+    save_to_csv(results, csv_path)
+    send_email_with_csv(csv_path, len(results))
 
 
 if __name__ == "__main__":
