@@ -567,6 +567,116 @@ async def _random_scroll(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Proxy local — resuelve incompatibilidad Chromium ↔ proxies HTTP con auth
+# ---------------------------------------------------------------------------
+
+class _LocalProxyServer:
+    """
+    Proxy HTTP local (127.0.0.1) que reenvía a un upstream con autenticación
+    pre-embebida. Resuelve el problema de Chromium con proxies que no soportan
+    el flujo de auth de dos pasos (CONNECT → 407 → CONNECT+auth).
+    """
+
+    def __init__(self, upstream: dict, host: str = "127.0.0.1", port: int = 0):
+        from urllib.parse import urlparse
+        parsed = urlparse(upstream["server"])
+        self._up_host = parsed.hostname
+        self._up_port = parsed.port or 80
+        self._auth    = base64.b64encode(
+            f"{upstream.get('username', '')}:{upstream.get('password', '')}".encode()
+        ).decode()
+        self._host    = host
+        self._port    = port          # 0 = asignar automáticamente
+        self._server  = None
+        self._log     = logging.getLogger("ndcourts.localproxy")
+
+    @property
+    def proxy_dict(self) -> dict:
+        return {"server": f"http://{self._host}:{self._port}"}
+
+    async def start(self):
+        self._server = await asyncio.start_server(
+            self._handle, self._host, self._port
+        )
+        self._port = self._server.sockets[0].getsockname()[1]
+        self._log.info("Proxy local iniciado en %s:%d → %s:%d",
+                       self._host, self._port, self._up_host, self._up_port)
+
+    async def stop(self):
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+    async def _handle(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter):
+        try:
+            first = await client_r.readline()
+            if not first:
+                return
+            headers = []
+            while True:
+                line = await client_r.readline()
+                headers.append(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+            parts = first.decode(errors="replace").split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                client_w.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                await client_w.drain()
+                return
+
+            target = parts[1]   # host:port
+            up_r, up_w = await asyncio.open_connection(self._up_host, self._up_port)
+            connect_req = (
+                f"CONNECT {target} HTTP/1.1\r\n"
+                f"Host: {target}\r\n"
+                f"Proxy-Authorization: Basic {self._auth}\r\n"
+                f"\r\n"
+            )
+            up_w.write(connect_req.encode())
+            await up_w.drain()
+
+            # Leer respuesta del upstream
+            resp_line = await up_r.readline()
+            while True:
+                hdr = await up_r.readline()
+                if hdr in (b"\r\n", b"\n", b""):
+                    break
+
+            if b"200" not in resp_line:
+                self._log.warning("Upstream rechazó CONNECT a %s: %s", target, resp_line.decode().strip())
+                client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_w.drain()
+                return
+
+            client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await client_w.drain()
+
+            await asyncio.gather(
+                self._pipe(client_r, up_w),
+                self._pipe(up_r, client_w),
+            )
+        except (ConnectionResetError, asyncio.IncompleteReadError, BrokenPipeError):
+            pass
+        except Exception as exc:
+            self._log.debug("LocalProxy error: %s", exc)
+        finally:
+            client_w.close()
+
+    @staticmethod
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            pass
+
+
 # Scraper principal
 # ---------------------------------------------------------------------------
 
@@ -610,9 +720,10 @@ class NDCourtsScraper:
             solver if solver is not None
             else create_captcha_solver(provider, api_key)
         )
-        self.headless = headless
-        self.proxy    = proxy
-        self._log     = logging.getLogger("ndcourts.scraper")
+        self.headless      = headless
+        self.proxy         = proxy
+        self._local_proxy  = None
+        self._log          = logging.getLogger("ndcourts.scraper")
         if proxy:
             server = proxy.get("server", "")
             user   = proxy.get("username", "")
@@ -642,10 +753,20 @@ class NDCourtsScraper:
             f"--window-size={viewport['width']},{viewport['height']}",
         ]
 
+        # Si hay proxy configurado, levantamos un proxy local que pre-embebe
+        # las credenciales. Chromium no soporta el flujo 407→auth con algunos
+        # proveedores, pero sí acepta proxies sin auth en localhost.
+        proxy_config = None
+        self._local_proxy = None
+        if self.proxy:
+            self._local_proxy = _LocalProxyServer(self.proxy)
+            await self._local_proxy.start()
+            proxy_config = self._local_proxy.proxy_dict
+
         browser = await playwright.chromium.launch(
             headless=headless if (headless := self.headless) else False,
             args=launch_args,
-            **({"proxy": self.proxy} if self.proxy else {}),
+            **({"proxy": proxy_config} if proxy_config else {}),
         )
 
         context = await browser.new_context(
@@ -657,7 +778,6 @@ class NDCourtsScraper:
             # NO sobreescribir Sec-Fetch-* ni Accept-* — el browser los genera
             # correctamente según el contexto de navegación. Forzarlos causa
             # ERR_TOO_MANY_REDIRECTS por conflicto con la gestión de sesión ASP.NET.
-            **({"proxy": self.proxy} if self.proxy else {}),
         )
 
         # Aplicar stealth completo via playwright-stealth al BrowserContext.
@@ -1386,6 +1506,9 @@ class NDCourtsScraper:
                 elapsed = time.monotonic() - t_total
                 self._log.debug("Browser cerrado — tiempo total de sesión: %.1fs", elapsed)
                 await browser.close()
+                if self._local_proxy:
+                    await self._local_proxy.stop()
+                    self._local_proxy = None
 
     async def search_by_date(
         self,
@@ -1508,6 +1631,9 @@ class NDCourtsScraper:
                 elapsed = time.monotonic() - t_total
                 self._log.debug("Browser cerrado — tiempo total de sesión: %.1fs", elapsed)
                 await browser.close()
+                if self._local_proxy:
+                    await self._local_proxy.stop()
+                    self._local_proxy = None
 
 
 # ---------------------------------------------------------------------------
