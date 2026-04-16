@@ -367,23 +367,28 @@ class CapSolverClient(CaptchaSolverBase):
         self._last_task_id: Optional[str] = None
         self._log         = logging.getLogger("ndcourts.capsolver")
 
-    async def _create_task(self, client: httpx.AsyncClient, task: dict) -> str:
-        """Crea una tarea en CapSolver y devuelve el taskId."""
+    async def _create_task(self, client: httpx.AsyncClient, task: dict) -> dict:
+        """Crea una tarea en CapSolver y devuelve el diccionario de respuesta completo."""
         resp = await client.post(f"{self.BASE_URL}/createTask", json={
             "clientKey": self.api_key,
             "task":      task,
         })
-        resp.raise_for_status()
+        
+        if resp.is_error:
+            self._log.error("CapSolver createTask falló (HTTP %d): %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
         data = resp.json()
-
         if data.get("errorId", 0) != 0:
-            self._log.error("CapSolver createTask error: %s", data)
-            raise RuntimeError(f"CapSolver createTask error: {data.get('errorDescription', data)}")
+            self._log.error("CapSolver createTask error de negocio: %s", data)
+            raise RuntimeError(f"CapSolver error: {data.get('errorDescription', data)}")
 
-        task_id = data["taskId"]
-        self._last_task_id = task_id
-        self._log.info("CapSolver task creada → taskId=%s", task_id)
-        return task_id
+        task_id = data.get("taskId")
+        if task_id:
+            self._last_task_id = task_id
+            self._log.info("CapSolver task creada → taskId=%s", task_id)
+        
+        return data
 
     async def _poll_task(self, client: httpx.AsyncClient, task_id: str) -> dict:
         """Hace polling hasta que la tarea esté lista. Devuelve el dict 'solution'."""
@@ -392,16 +397,24 @@ class CapSolverClient(CaptchaSolverBase):
         while time.monotonic() < deadline:
             await asyncio.sleep(CAPTCHA_POLL_INTERVAL)
             polls += 1
-            res = await client.post(f"{self.BASE_URL}/getTaskResult", json={
+            
+            payload = {
                 "clientKey": self.api_key,
                 "taskId":    task_id,
-            })
-            res.raise_for_status()
-            result = res.json()
+            }
+            res = await client.post(f"{self.BASE_URL}/getTaskResult", json=payload)
+            
+            if res.is_error:
+                self._log.error(
+                    "CapSolver getTaskResult falló (HTTP %d) - ID: %s - Body: %s",
+                    res.status_code, task_id, res.text
+                )
+                res.raise_for_status()
 
+            result = res.json()
             if result.get("errorId", 0) != 0:
-                self._log.error("CapSolver getTaskResult error: %s", result)
-                raise RuntimeError(f"CapSolver getTaskResult error: {result.get('errorDescription', result)}")
+                self._log.error("CapSolver getTaskResult error de negocio: %s", result)
+                raise RuntimeError(f"CapSolver error: {result.get('errorDescription', result)}")
 
             status = result.get("status")
             if status == "ready":
@@ -419,11 +432,20 @@ class CapSolverClient(CaptchaSolverBase):
         self._log.debug("Enviando imagen a CapSolver — tamaño=%d bytes", len(image_bytes))
 
         async with httpx.AsyncClient(timeout=30) as client:
-            task_id  = await self._create_task(client, {
+            data = await self._create_task(client, {
                 "type": "ImageToTextTask",
                 "body": image_b64,
             })
-            solution = await self._poll_task(client, task_id)
+            
+            # ImageToTextTask suele resolverse inmediatamente
+            if data.get("status") == "ready":
+                solution = data.get("solution", {})
+            else:
+                task_id  = data.get("taskId")
+                if not task_id:
+                    raise RuntimeError(f"CapSolver no devolvió taskId ni solución: {data}")
+                solution = await self._poll_task(client, task_id)
+            
             text     = solution.get("text", "")
             elapsed  = time.monotonic() - t_start
             self._log.info("CapSolver CAPTCHA resuelto → '%s'  (tiempo=%.1fs)", text, elapsed)
@@ -435,18 +457,27 @@ class CapSolverClient(CaptchaSolverBase):
         self._log.info("Enviando Cloudflare Turnstile a CapSolver — sitekey=%s", sitekey)
 
         async with httpx.AsyncClient(timeout=30) as client:
-            task_id  = await self._create_task(client, {
+            data = await self._create_task(client, {
                 "type":       "AntiTurnstileTaskProxyless",
                 "websiteURL": pageurl,
                 "websiteKey": sitekey,
             })
-            solution = await self._poll_task(client, task_id)
+            
+            if data.get("status") == "ready":
+                solution = data.get("solution", {})
+            else:
+                task_id  = data.get("taskId")
+                if not task_id:
+                    raise RuntimeError(f"CapSolver no devolvió taskId ni solución: {data}")
+                solution = await self._poll_task(client, task_id)
+                
             token    = solution.get("token", "")
             elapsed  = time.monotonic() - t_start
             self._log.info(
                 "CapSolver Turnstile resuelto (tiempo=%.1fs) token=%s…",
                 elapsed, token[:40],
             )
+
             return token
 
     async def report_bad(self) -> None:
@@ -804,41 +835,80 @@ class NDCourtsScraper:
     # Helpers internos
     # ------------------------------------------------------------------
 
-    async def _get_captcha_image(self, page: Page) -> bytes:
-        """Descarga la imagen CAPTCHA usando las cookies de sesión activa."""
-        src = await page.eval_on_selector(
-            'img[alt="CAPTCHA code image"]',
-            "el => el.src"
-        )
-        self._log.debug("CAPTCHA image URL: %s", src)
-        response = await page.request.get(src, headers={"Referer": SEARCH_URL})
-        if not response.ok:
-            self._log.error("Fallo al descargar CAPTCHA — HTTP %d  URL=%s", response.status, src)
-            raise RuntimeError(f"No se pudo descargar CAPTCHA: HTTP {response.status}")
+    async def _get_captcha_image(self, page: Page, max_retries: int = 3) -> bytes:
+        """
+        Descarga la imagen CAPTCHA con verificaciones de integridad y reintentos.
+        Si la imagen no carga o es inválida, intenta refrescarla antes de fallar.
+        """
+        selector = 'img[alt="CAPTCHA code image"]'
+        refresh_selector = 'a:has-text("Try another code"), a:has-text("Refresh"), #LnkRefreshCaptcha'
 
-        content_type = response.headers.get("content-type", "")
-        body = await response.body()
-        self._log.debug("CAPTCHA descargado — %d bytes  content-type=%s", len(body), content_type)
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 1. Esperar a que el elemento sea visible
+                img_el = await page.wait_for_selector(selector, state="visible", timeout=10000)
+                if not img_el:
+                    raise RuntimeError("Elemento CAPTCHA no encontrado en el DOM")
 
-        # Verificar que realmente es una imagen y no un HTML de error/sesión expirada
-        if "text/html" in content_type or (len(body) > 0 and body[:1] == b"<"):
-            self._log.error(
-                "CAPTCHA URL devolvió HTML en lugar de imagen — "
-                "sesión inválida o token expirado. content-type=%s  preview=%s",
-                content_type, body[:80],
-            )
-            raise ValueError("CAPTCHA devolvió HTML — sesión inválida, recargar página")
+                # 2. Verificar dimensiones reales via JS (evita imágenes rotas)
+                is_valid = await page.eval_on_selector(selector, """
+                    el => el.complete && typeof el.naturalWidth !== 'undefined' && el.naturalWidth > 0
+                """)
+                
+                if not is_valid:
+                    self._log.warning("Imagen CAPTCHA detectada como 'rota' en el browser (intento %d)", attempt)
+                    if attempt < max_retries:
+                        refresh_link = await page.query_selector(refresh_selector)
+                        if refresh_link:
+                            self._log.info("Haciendo clic en 'Try another code' para refrescar...")
+                            await _human_click_element(page, refresh_link)
+                            await _random_delay(1.5, 3.0)
+                            continue
+                    raise ValueError("La imagen del CAPTCHA no se cargó correctamente (ancho 0)")
 
-        # Verificar magic bytes de imagen (PNG o JPEG)
-        is_png  = body[:4] == b"\x89PNG"
-        is_jpeg = body[:2] == b"\xff\xd8"
-        if not (is_png or is_jpeg):
-            self._log.warning(
-                "CAPTCHA con magic bytes inesperados: %s — intentando de todos modos",
-                body[:8].hex(),
-            )
+                # 3. Obtener URL y descargar con los mismos headers de sesión
+                src = await img_el.get_attribute("src")
+                if not src:
+                    raise ValueError("Atributo 'src' del CAPTCHA está vacío")
+                
+                # Convertir URL relativa en absoluta
+                abs_url = urljoin(page.url, src)
 
-        return body
+                self._log.debug("Descargando CAPTCHA desde: %s (intento %d)", abs_url, attempt)
+                response = await page.request.get(abs_url, headers={"Referer": page.url})
+                
+                if not response.ok:
+                    raise RuntimeError(f"Error HTTP {response.status} al descargar CAPTCHA")
+
+                body = await response.body()
+                content_type = response.headers.get("content-type", "").lower()
+
+                # 4. Validaciones de contenido
+                if len(body) < 100:
+                    raise ValueError(f"Imagen CAPTCHA demasiado pequeña ({len(body)} bytes)")
+                
+                if "text/html" in content_type or body.startswith(b"<"):
+                    raise ValueError("La URL del CAPTCHA devolvió HTML (posible sesión expirada)")
+
+                # Verificar magic bytes básicos (PNG, JPEG, GIF)
+                if not (body.startswith(b"\x89PNG") or body.startswith(b"\xff\xd8") or body.startswith(b"GIF8")):
+                    self._log.warning("Formato de imagen CAPTCHA desconocido (bytes: %s)", body[:8].hex())
+
+                self._log.debug("CAPTCHA cargado con éxito (%d bytes)", len(body))
+                return body
+
+            except Exception as e:
+                self._log.warning("Fallo en _get_captcha_image (intento %d/%d): %s", attempt, max_retries, e)
+                if attempt == max_retries:
+                    raise
+                
+                # Intentar refrescar la imagen si existe el link, sino esperar
+                refresh_link = await page.query_selector(refresh_selector)
+                if refresh_link:
+                    await _human_click_element(page, refresh_link)
+                await _random_delay(2.0, 4.0)
+
+        raise RuntimeError("No se pudo obtener una imagen CAPTCHA válida tras varios intentos")
 
     async def _fill_and_submit(self, page: Page, params: SearchParams, captcha_text: str) -> None:
         """Rellena el formulario con comportamiento humano y hace submit."""
