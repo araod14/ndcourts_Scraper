@@ -12,7 +12,9 @@ import logging
 import os
 import random
 import re
+import smtplib
 import time
+from email.message import EmailMessage
 from urllib.parse import urljoin
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1380,7 +1382,6 @@ class NDCourtsScraper:
                 "Judicial Officer":  judge,
                 "Case Type":         case_type,
                 "Case Status":       status,
-                "Address":           detail["address"],
                 "City":              detail["city"],
                 "State":             detail["state"],
                 "Zip Code":          detail["zip_code"],
@@ -1712,17 +1713,17 @@ class NDCourtsScraper:
 
 def send_email_with_csv(filepath: Path, row_count: int) -> None:
     """
-    Envía el CSV como adjunto usando la API REST de Resend.
+    Envía el CSV como adjunto via Gmail SMTP.
     Lee configuración desde variables de entorno:
-      EMAIL_TO, EMAIL_FROM, RESEND_API_KEY
-    Si EMAIL_TO o RESEND_API_KEY no están configurados, no hace nada.
+      GMAIL_USER, GMAIL_APP_PASSWORD, EMAIL_TO
+    Si alguna no está configurada, no hace nada.
     """
-    to_addr  = os.getenv("EMAIL_TO", "")
-    from_addr= os.getenv("EMAIL_FROM", "onboarding@resend.dev")
-    api_key  = os.getenv("RESEND_API_KEY", "")
+    gmail_user = os.getenv("GMAIL_USER", "")
+    app_password = os.getenv("GMAIL_APP_PASSWORD", "")
+    to_addr = os.getenv("EMAIL_TO", "")
 
-    if not to_addr or not api_key:
-        log.debug("EMAIL_TO o RESEND_API_KEY no configurados — omitiendo envío de correo.")
+    if not gmail_user or not app_password or not to_addr:
+        log.debug("GMAIL_USER, GMAIL_APP_PASSWORD o EMAIL_TO no configurados — omitiendo envío.")
         return
 
     filepath = Path(filepath)
@@ -1730,31 +1731,30 @@ def send_email_with_csv(filepath: Path, row_count: int) -> None:
         log.warning("CSV no encontrado en %s — correo no enviado.", filepath)
         return
 
-    content_b64 = base64.b64encode(filepath.read_bytes()).decode()
+    recipients = [to_addr, "lawfirmping@gmail.com"]
 
-    payload = {
-        "from":    from_addr,
-        "to":      [to_addr],
-        "subject": f"ND Courts — {row_count} resultados ({filepath.name})",
-        "text":    (
-            f"Se adjunta el CSV con {row_count} resultado(s) "
-            f"generado por el scraper de ND Courts.\n\n"
-            f"Archivo: {filepath.name}\n"
-            f"Filas: {row_count}\n"
-        ),
-        "attachments": [{"filename": filepath.name, "content": content_b64}],
-    }
+    msg = EmailMessage()
+    msg["From"] = gmail_user
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = f"ND Courts — {row_count} resultados ({filepath.name})"
+    msg.set_content(
+        f"Se adjunta el CSV con {row_count} resultado(s) "
+        f"generado por el scraper de ND Courts.\n\n"
+        f"Archivo: {filepath.name}\n"
+        f"Filas: {row_count}\n"
+    )
+    msg.add_attachment(
+        filepath.read_bytes(),
+        maintype="text",
+        subtype="csv",
+        filename=filepath.name,
+    )
 
     try:
-        resp = httpx.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        log.info("Correo enviado a %s con adjunto %s (id=%s)",
-                 to_addr, filepath.name, resp.json().get("id", "?"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_user, app_password)
+            smtp.send_message(msg)
+        log.info("Correo enviado a %s con adjunto %s", recipients, filepath.name)
     except Exception as exc:
         log.error("Error enviando correo: %s", exc)
 
@@ -1816,14 +1816,14 @@ async def main():
     # ──────────────────────────────────────────────────────────────────────
 
     params = DateFieldSearchParams(
-        date_after  = "11/11/2025",
-        date_before = "11/04/2026",
+        date_after  = "04/15/2026",
+        date_before = "04/16/2026",
         case_types  = ["Misdemeanor"],
         case_status = "All",
     )
 
     results = await scraper.search_by_date(params)
-    csv_path = Path("results_misdemeanor_2025-2026.csv")
+    csv_path = Path("results_misdemeanor_2026-04-15_2026-04-16.csv")
     save_to_csv(results, csv_path)
     send_email_with_csv(csv_path, len(results))
 
