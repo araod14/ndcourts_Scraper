@@ -1894,12 +1894,14 @@ async def main():
     )
     # ──────────────────────────────────────────────────────────────────────
 
-    yesterday_dt = datetime.now() - timedelta(days=1)
-    yesterday    = yesterday_dt.strftime("%m/%d/%Y")
-    csv_date     = yesterday_dt.strftime("%Y-%m-%d")
+    yesterday_dt      = datetime.now() - timedelta(days=1)
+    day_before_yest_dt = datetime.now() - timedelta(days=2)
+    yesterday          = yesterday_dt.strftime("%m/%d/%Y")
+    day_before_yest    = day_before_yest_dt.strftime("%m/%d/%Y")
+    csv_date           = yesterday_dt.strftime("%Y-%m-%d")
 
     params = DateFieldSearchParams(
-        date_after  = yesterday,
+        date_after  = day_before_yest,
         date_before = yesterday,
         case_types  = ["Misdemeanor"],
         case_status = "All",
