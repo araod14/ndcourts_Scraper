@@ -36,3 +36,6 @@ results_*.csv
 *.css
 *.js
 *.html
+*.sh
+
+enrich_csv.py
