@@ -831,6 +831,19 @@ class NDCourtsScraper:
 
         self._log.debug("Stealth configurado")
 
+        await context.add_cookies([
+            {
+                "name": "__cf_bm",
+                "value": "rbhyZC5At28IrQywM3196.lNqBlCkKyqcWkhkTX_cj4-1776489792.8202412-1.0.1.1-FN5UHLwWQrJYUes7YyW9KMi4.V9pnlPLoKdozOkjtXjLI6gx3Nn5uPB92WR05NqeKPyr_O4ac9kOUPy67MLLPcTdSRA78xs0FC6rmOmqDX9CVZWpE9lfwsaC97xb8viv",
+                "domain": ".ndcourts.gov",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+                "sameSite": "None",
+            }
+        ])
+        self._log.debug("Cookies pre-cargadas en el contexto")
+
         return browser, context
 
     # ------------------------------------------------------------------
