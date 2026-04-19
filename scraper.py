@@ -18,14 +18,17 @@ from email.message import EmailMessage
 from urllib.parse import urljoin
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Literal
 
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, Page, BrowserContext, ConsoleMessage
+try:
+    from rebrowser_playwright.async_api import async_playwright, Page, BrowserContext, ConsoleMessage
+except ImportError:
+    from playwright.async_api import async_playwright, Page, BrowserContext, ConsoleMessage
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -91,14 +94,14 @@ CaptchaProvider = Literal["2captcha", "solvecaptcha", "capsolver"]
 # Anti-detección — constantes
 # ---------------------------------------------------------------------------
 
-# Pool de User-Agents reales de Chrome en Windows/Mac/Linux (2024)
+# Pool de User-Agents reales de Chrome en Windows/Mac (2025-2026, versiones 134-136)
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
 ]
 
 # Resoluciones de pantalla comunes
@@ -550,11 +553,31 @@ async def _human_type(page: Page, selector: str, text: str) -> None:
             await asyncio.sleep(random.uniform(0.3, 0.7))
 
 
+def _bezier_points(x0: float, y0: float, x1: float, y1: float, steps: int) -> list[tuple[float, float]]:
+    """Genera puntos de una curva Bezier cuadrática entre (x0,y0) y (x1,y1)."""
+    cx = random.uniform(min(x0, x1), max(x0, x1))
+    cy = random.uniform(min(y0, y1) - 60, max(y0, y1) + 60)
+    pts = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+        by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+        pts.append((bx, by))
+    return pts
+
+
+async def _bezier_move(page: Page, tx: float, ty: float) -> None:
+    """Mueve el mouse desde la posición actual hasta (tx, ty) con trayectoria Bezier."""
+    pos = await page.evaluate("() => ({x: window._mouseX ?? 300, y: window._mouseY ?? 300})")
+    steps = random.randint(18, 35)
+    for bx, by in _bezier_points(pos["x"], pos["y"], tx, ty, steps):
+        await page.mouse.move(bx, by)
+        await asyncio.sleep(random.uniform(0.005, 0.018))
+    await asyncio.sleep(random.uniform(0.06, 0.18))
+
+
 async def _human_click(page: Page, selector: str) -> None:
-    """
-    Mueve el ratón hacia el elemento con un leve offset aleatorio antes de clicar,
-    imitando la trayectoria natural del cursor.
-    """
+    """Mueve el ratón en curva Bezier hasta el elemento y hace clic."""
     element = await page.query_selector(selector)
     if not element:
         return
@@ -563,14 +586,9 @@ async def _human_click(page: Page, selector: str) -> None:
         await page.click(selector)
         return
 
-    # Punto objetivo con jitter de ±4px dentro del elemento
     target_x = box["x"] + box["width"]  / 2 + random.uniform(-4, 4)
     target_y = box["y"] + box["height"] / 2 + random.uniform(-4, 4)
-
-    # Movimiento en varios pasos (simula trayectoria)
-    steps = random.randint(8, 20)
-    await page.mouse.move(target_x, target_y, steps=steps)
-    await asyncio.sleep(random.uniform(0.05, 0.15))
+    await _bezier_move(page, target_x, target_y)
     await page.mouse.click(target_x, target_y)
 
 
@@ -585,18 +603,44 @@ async def _human_click_element(page: Page, element) -> None:
         return
     target_x = box["x"] + box["width"]  / 2 + random.uniform(-4, 4)
     target_y = box["y"] + box["height"] / 2 + random.uniform(-4, 4)
-    steps = random.randint(8, 20)
-    await page.mouse.move(target_x, target_y, steps=steps)
+    await _bezier_move(page, target_x, target_y)
     await asyncio.sleep(random.uniform(0.05, 0.15))
     await page.mouse.click(target_x, target_y)
 
 
+async def _wait_for_launch_search(page: Page, timeout: float = 10.0) -> None:
+    """Espera a que window.LaunchSearch esté definido (Firefox puede tardar más que Chrome)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        defined = await page.evaluate("typeof LaunchSearch === 'function'")
+        if defined:
+            return
+        await asyncio.sleep(0.25)
+    raise RuntimeError("LaunchSearch no se definió en la página tras %.0fs" % timeout)
+
+
 async def _random_scroll(page: Page) -> None:
-    """Scroll aleatorio para simular lectura de la página."""
-    scroll_y = random.randint(80, 250)
-    await page.mouse.wheel(0, scroll_y)
-    await _random_delay(0.3, 0.8)
-    await page.mouse.wheel(0, -scroll_y)
+    """Scroll irregular en varios pasos simulando lectura de la página."""
+    total = random.randint(80, 280)
+    chunks = random.randint(2, 5)
+    for _ in range(chunks):
+        dy = total // chunks + random.randint(-15, 15)
+        await page.mouse.wheel(0, dy)
+        await asyncio.sleep(random.uniform(0.15, 0.45))
+    await asyncio.sleep(random.uniform(0.4, 1.2))
+    await page.mouse.wheel(0, -total)
+
+
+async def _human_idle(page: Page, min_s: float = 1.5, max_s: float = 4.0) -> None:
+    """Simula al usuario leyendo la página: mueve el mouse aleatoriamente y espera."""
+    vp = page.viewport_size or {"width": 1280, "height": 800}
+    moves = random.randint(2, 5)
+    for _ in range(moves):
+        mx = random.uniform(vp["width"] * 0.1, vp["width"] * 0.9)
+        my = random.uniform(vp["height"] * 0.1, vp["height"] * 0.7)
+        await _bezier_move(page, mx, my)
+        await asyncio.sleep(random.uniform(0.2, 0.6))
+    await asyncio.sleep(random.uniform(min_s, max_s))
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +800,7 @@ class NDCourtsScraper:
         self.headless      = headless
         self.proxy         = proxy
         self._local_proxy  = None
+        self._camoufox_cm  = None
         self._log          = logging.getLogger("ndcourts.scraper")
         if proxy:
             server = proxy.get("server", "")
@@ -769,26 +814,64 @@ class NDCourtsScraper:
     # ------------------------------------------------------------------
 
     async def _build_context(self, playwright) -> tuple:
-        """Lanza el browser y devuelve (browser, context) configurados con stealth."""
-        ua       = random.choice(_USER_AGENTS)
+        """Lanza el browser y devuelve (browser, context) configurados con stealth.
+
+        Intenta usar camoufox (Firefox-based, mejor evasión de Cloudflare).
+        Si no está instalado, cae en Chromium con rebrowser-playwright + playwright-stealth.
+        """
         viewport = random.choice(_VIEWPORTS)
+
+        # ------------------------------------------------------------------
+        # Opción A: camoufox — Firefox stealth, fingerprint completamente distinto
+        # ------------------------------------------------------------------
+        try:
+            from camoufox.async_api import AsyncCamoufox
+
+            camoufox_kwargs: dict = {
+                "headless": self.headless,
+                "os":       ("windows", "macos"),
+                "locale":   ["en-US", "en"],
+            }
+
+            if self.proxy:
+                proxy_cfg: dict = {"server": self.proxy.get("server", "")}
+                if self.proxy.get("username"):
+                    proxy_cfg["username"] = self.proxy["username"]
+                    proxy_cfg["password"] = self.proxy.get("password", "")
+                camoufox_kwargs["proxy"] = proxy_cfg
+
+            self._camoufox_cm = AsyncCamoufox(**camoufox_kwargs)
+            browser = await self._camoufox_cm.__aenter__()
+
+            context = await browser.new_context(
+                viewport=viewport,
+                timezone_id="America/Chicago",
+                color_scheme="light",
+            )
+            self._log.debug("camoufox activo — Firefox stealth (viewport=%dx%d)",
+                            viewport["width"], viewport["height"])
+            return browser, context
+
+        except ImportError:
+            self._camoufox_cm = None
+            self._log.debug("camoufox no disponible — usando Chromium")
+
+        # ------------------------------------------------------------------
+        # Opción B: Chromium con rebrowser-playwright + playwright-stealth
+        # ------------------------------------------------------------------
+        ua = random.choice(_USER_AGENTS)
         self._log.debug("Browser config — UA='%s'  viewport=%dx%d  headless=%s",
                         ua, viewport["width"], viewport["height"], self.headless)
 
         launch_args = [
-            "--disable-blink-features=AutomationControlled",  # elimina el flag CDP de automatización
+            "--disable-blink-features=AutomationControlled",
             "--disable-infobars",
             "--disable-dev-shm-usage",
             "--no-first-run",
             "--no-default-browser-check",
-            # NOTA: --disable-extensions se omite: Cloudflare Turnstile lo detecta
-            # como "Incompatible browser extension or network configuration"
             f"--window-size={viewport['width']},{viewport['height']}",
         ]
 
-        # Si hay proxy configurado, levantamos un proxy local que pre-embebe
-        # las credenciales. Chromium no soporta el flujo 407→auth con algunos
-        # proveedores, pero sí acepta proxies sin auth en localhost.
         proxy_config = None
         self._local_proxy = None
         if self.proxy:
@@ -806,16 +889,10 @@ class NDCourtsScraper:
             user_agent=ua,
             viewport=viewport,
             locale="en-US",
-            timezone_id="America/Chicago",    # North Dakota está en CT/MT
+            timezone_id="America/Chicago",
             color_scheme="light",
-            # NO sobreescribir Sec-Fetch-* ni Accept-* — el browser los genera
-            # correctamente según el contexto de navegación. Forzarlos causa
-            # ERR_TOO_MANY_REDIRECTS por conflicto con la gestión de sesión ASP.NET.
         )
 
-        # Aplicar stealth completo via playwright-stealth al BrowserContext.
-        # Cubre: navigator.webdriver, plugins, plataforma, WebGL, canvas, permisos, etc.
-        # El platform_override='Win32' coincide con los User-Agents de Windows del pool.
         try:
             from playwright_stealth import Stealth
             stealth = Stealth(
@@ -829,20 +906,7 @@ class NDCourtsScraper:
             self._log.debug("playwright-stealth no disponible (%s) — usando script manual", e)
             await context.add_init_script(_STEALTH_SCRIPT)
 
-        self._log.debug("Stealth configurado")
-
-        await context.add_cookies([
-            {
-                "name": "__cf_bm",
-                "value": "rbhyZC5At28IrQywM3196.lNqBlCkKyqcWkhkTX_cj4-1776489792.8202412-1.0.1.1-FN5UHLwWQrJYUes7YyW9KMi4.V9pnlPLoKdozOkjtXjLI6gx3Nn5uPB92WR05NqeKPyr_O4ac9kOUPy67MLLPcTdSRA78xs0FC6rmOmqDX9CVZWpE9lfwsaC97xb8viv",
-                "domain": ".ndcourts.gov",
-                "path": "/",
-                "secure": True,
-                "httpOnly": True,
-                "sameSite": "None",
-            }
-        ])
-        self._log.debug("Cookies pre-cargadas en el contexto")
+        # __cf_bm se omite: expira en 30 min y una cookie vencida activa detección
 
         return browser, context
 
@@ -930,7 +994,8 @@ class NDCourtsScraper:
         self._log.debug("Rellenando formulario — last_name='%s' first_name='%s'",
                         params.last_name, params.first_name)
 
-        # Scroll suave antes de empezar a escribir
+        # Simular lectura de la página antes de interactuar
+        await _human_idle(page, min_s=1.5, max_s=3.5)
         await _random_scroll(page)
         await _random_delay(0.4, 1.0)
 
@@ -1510,11 +1575,8 @@ class NDCourtsScraper:
                 # que ocurría con el patrón expect_popup + except.
                 # wait_for_url en lugar de networkidle: Cloudflare Turnstile mantiene
                 # requests activos indefinidamente e impide que networkidle resuelva.
-                self._log.debug("Ejecutando LaunchSearch via JS")
-                await page.evaluate(
-                    "LaunchSearch('Search.aspx?ID=100', false, true, "
-                    "document.getElementById('sbxControlID2'))"
-                )
+                self._log.debug("Haciendo clic en Criminal\\Traffic")
+                await _human_click(page, 'a:has-text("Criminal")')
                 await page.wait_for_url("**/Search.aspx**", timeout=15000)
                 search_page = page
                 self._log.debug("URL de búsqueda: %s", search_page.url)
@@ -1590,6 +1652,9 @@ class NDCourtsScraper:
                 elapsed = time.monotonic() - t_total
                 self._log.debug("Browser cerrado — tiempo total de sesión: %.1fs", elapsed)
                 await browser.close()
+                if self._camoufox_cm:
+                    await self._camoufox_cm.__aexit__(None, None, None)
+                    self._camoufox_cm = None
                 if self._local_proxy:
                     await self._local_proxy.stop()
                     self._local_proxy = None
@@ -1632,10 +1697,8 @@ class NDCourtsScraper:
                 await page.select_option('#sbxControlID2', label="State of North Dakota")
                 await _random_delay(2.0, 6.0)
 
-                await page.evaluate(
-                    "LaunchSearch('Search.aspx?ID=100', false, true, "
-                    "document.getElementById('sbxControlID2'))"
-                )
+                self._log.debug("Haciendo clic en Criminal\\Traffic")
+                await _human_click(page, 'a:has-text("Criminal")')
                 await page.wait_for_url("**/Search.aspx**", timeout=20000)
                 search_page = page
 
@@ -1715,6 +1778,9 @@ class NDCourtsScraper:
                 elapsed = time.monotonic() - t_total
                 self._log.debug("Browser cerrado — tiempo total de sesión: %.1fs", elapsed)
                 await browser.close()
+                if self._camoufox_cm:
+                    await self._camoufox_cm.__aexit__(None, None, None)
+                    self._camoufox_cm = None
                 if self._local_proxy:
                     await self._local_proxy.stop()
                     self._local_proxy = None
@@ -1828,15 +1894,19 @@ async def main():
     )
     # ──────────────────────────────────────────────────────────────────────
 
+    yesterday_dt = datetime.now() - timedelta(days=1)
+    yesterday    = yesterday_dt.strftime("%m/%d/%Y")
+    csv_date     = yesterday_dt.strftime("%Y-%m-%d")
+
     params = DateFieldSearchParams(
-        date_after  = "04/15/2026",
-        date_before = "04/16/2026",
+        date_after  = yesterday,
+        date_before = yesterday,
         case_types  = ["Misdemeanor"],
         case_status = "All",
     )
 
     results = await scraper.search_by_date(params)
-    csv_path = Path("results_misdemeanor_2026-04-15_2026-04-16.csv")
+    csv_path = Path(f"results_misdemeanor_{csv_date}.csv")
     save_to_csv(results, csv_path)
     send_email_with_csv(csv_path, len(results))
 
