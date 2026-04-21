@@ -22,9 +22,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Literal
 
+import io
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from PIL import Image, ImageEnhance, ImageFilter
 try:
     from rebrowser_playwright.async_api import async_playwright, Page, BrowserContext, ConsoleMessage
 except ImportError:
@@ -539,13 +541,45 @@ async def _random_delay(min_s: float = 0.5, max_s: float = 1.8) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
+def _preprocess_captcha(image_bytes: bytes) -> bytes:
+    """
+    Preprocesa la imagen CAPTCHA de LanAP para mejorar la precisión del solver.
+
+    LanAP genera dos estilos observados:
+      - Texto naranja/rojo sobre fondo blanco
+      - Texto negro sobre fondo en damero blanco/negro
+
+    Estrategia: escalar 3x, convertir a escala de grises con blur ligero para
+    suavizar el patrón de fondo, luego binarizar con umbral adaptativo alto
+    (el texto siempre es más oscuro que el fondo promediado).
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    # Escalar 3x para dar más resolución al OCR
+    img = img.resize((w * 3, h * 3), Image.LANCZOS)
+    # Escala de grises
+    gray = img.convert("L")
+    # Blur ligero: suaviza el patrón damero (fondo) sin borrar el texto
+    gray = gray.filter(ImageFilter.GaussianBlur(radius=1))
+    # Binarizar: umbral 180 → texto (≤180) negro, fondo (>180) blanco
+    # Funciona para texto naranja (L≈135) y texto negro (L≈0) sobre fondos claros
+    bw = gray.point(lambda p: 0 if p <= 180 else 255, "L").convert("RGB")
+    buf = io.BytesIO()
+    bw.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def _human_type(page: Page, selector: str, text: str) -> None:
     """
     Escribe texto carácter a carácter con velocidad variable (30–130 ms/char).
+    Limpia el campo primero (triple-click selecciona todo) para evitar que texto
+    residual de intentos anteriores o autofill se acumule con el nuevo valor.
     Ocasionalmente hace una pausa más larga, como cuando un humano duda.
     """
-    await page.click(selector)
-    await _random_delay(0.1, 0.4)
+    await page.click(selector, click_count=3)  # triple-click → selecciona todo
+    await _random_delay(0.1, 0.3)
+    await page.keyboard.press("Delete")        # borra selección
+    await _random_delay(0.1, 0.2)
     for char in text:
         await page.keyboard.type(char, delay=random.uniform(30, 130))
         # Pausa de "duda" con probabilidad 5 %
@@ -974,6 +1008,19 @@ class NDCourtsScraper:
                     self._log.warning("Formato de imagen CAPTCHA desconocido (bytes: %s)", body[:8].hex())
 
                 self._log.debug("CAPTCHA cargado con éxito (%d bytes)", len(body))
+                # Guardar imagen original y preprocesada para diagnóstico
+                try:
+                    Path("debug_screenshots").mkdir(exist_ok=True)
+                    Path(f"debug_screenshots/captcha_raw_{attempt}.png").write_bytes(body)
+                except Exception:
+                    pass
+                # Preprocesar para mejorar OCR del solver
+                try:
+                    body = _preprocess_captcha(body)
+                    Path(f"debug_screenshots/captcha_processed_{attempt}.png").write_bytes(body)
+                    self._log.debug("CAPTCHA preprocesado — nuevo tamaño: %d bytes", len(body))
+                except Exception as prep_err:
+                    self._log.warning("Preprocesamiento CAPTCHA falló, usando imagen original: %s", prep_err)
                 return body
 
             except Exception as e:
@@ -1061,45 +1108,47 @@ class NDCourtsScraper:
 
         self._log.debug("Enviando formulario (click en SearchSubmit)")
         await _human_click(page, "#SearchSubmit")
+        # ASP.NET WebForms usa UpdatePanel (AJAX parcial) — esperar resultados directamente
+        try:
+            await page.wait_for_selector(
+                "tr:has(td > a[href*='CaseDetail']), "
+                "span.ErrorMessages, #lblError, "
+                "span[style*='color:red'], "
+                "td[colspan]:has-text('no')",
+                timeout=60000,
+            )
+        except Exception:
+            self._log.warning("Timeout esperando respuesta del servidor tras submit — continuando")
+        self._log.debug("Post-submit listo — URL: %s", page.url)
 
     async def _fill_date_field_search(
-        self, page: Page, params: "DateFieldSearchParams", captcha_text: str
+        self, page: Page, params: "DateFieldSearchParams"
     ) -> None:
         """
         Rellena el formulario en modo 'Date Filed' (búsqueda por rango de fechas).
 
-        Análisis del HTML (Search.aspx):
-        - Radio #DateFiled (value="6") llama SwitchCaseSearch('6', true) vía onclick.
-        - Eso oculta trParamsForSearch (que contiene DateFiledOnAfter, DateFiledOnBefore,
-          selCaseTypeGroups name="CaseTypes" y SortBy).
-        - Los campos quedan en el DOM pero con display:none — se manipulan vía JS.
-        - CaseStatus (AllOption/OpenOption/ClosedOption) también está oculto → JS.
-        - SearchMode hidden input se establece en "FILED" por el JS del formulario.
+        ORDEN CRÍTICO: el CAPTCHA se obtiene y escribe AL FINAL, después de hacer
+        click en #DateFiled y configurar todos los campos. El radio #DateFiled puede
+        disparar un postback de ASP.NET UpdatePanel que regenera la imagen CAPTCHA;
+        si resolvemos el CAPTCHA antes del click, el servidor rechaza el texto antiguo.
         """
         self._log.debug("Rellenando formulario DATE FIELD — after='%s' before='%s'",
                         params.date_after, params.date_before)
 
         await _random_scroll(page)
-        await _random_delay(2.0, 6.0)
+        await _random_delay(1.0, 3.0)
 
-        # CAPTCHA — siempre visible
-        self._log.debug("Escribiendo texto CAPTCHA: '%s'", captcha_text)
-        await _human_type(page, "#CodeTextBox", captcha_text)
-        await _random_delay(2.0, 6.0)
-
-        # Activar modo "Date Filed" — clic en radio #DateFiled (id del HTML)
+        # 1. Activar modo "Date Filed" PRIMERO
         self._log.debug("Activando modo 'Date Filed' (radio #DateFiled)")
         await _human_click(page, "#DateFiled")
-        # JS del formulario se ejecuta síncronamente; dar tiempo al navegador para repintar
-        await _random_delay(2.0, 6.0)
+        await _random_delay(2.0, 4.0)
 
-        # Confirmar que el modo cambió y loguear el estado
         search_mode = await page.evaluate(
             "() => document.getElementById('SearchMode')?.value"
         )
         self._log.debug("SearchMode tras clic en DateFiled: '%s'", search_mode)
 
-        # Rellenar fechas vía JS (los inputs están ocultos bajo trParamsForSearch)
+        # 2. Rellenar fechas vía JS
         self._log.debug("Seteando fechas vía JS — after='%s' before='%s'",
                         params.date_after, params.date_before)
         await page.evaluate("""
@@ -1110,9 +1159,9 @@ class NDCourtsScraper:
                 if (b) { b.value = before; b.dispatchEvent(new Event('change', {bubbles:true})); }
             }
         """, [params.date_after, params.date_before])
-        await _random_delay(2.0, 6.0)
+        await _random_delay(1.0, 2.0)
 
-        # Case Status vía JS (radio buttons también dentro de trParamsForSearch)
+        # 3. Case Status vía JS
         status_values = {"All": "0", "Open": "1", "Closed": "2"}
         status_val = status_values.get(params.case_status, "0")
         self._log.debug("CaseStatus (JS): '%s' → value=%s", params.case_status, status_val)
@@ -1124,9 +1173,9 @@ class NDCourtsScraper:
                 }
             }
         """, status_val)
-        await _random_delay(2.0, 6.0)
+        await _random_delay(1.0, 2.0)
 
-        # Case Types vía JS — selCaseTypeGroups (name="CaseTypes") oculto en trParamsForSearch
+        # 4. Case Types vía JS
         if params.case_types:
             self._log.debug("CaseTypes (JS): %s", params.case_types)
             matched = await page.evaluate("""
@@ -1145,12 +1194,34 @@ class NDCourtsScraper:
                 }
             """, params.case_types)
             self._log.debug("CaseTypes resultado JS: %s", matched)
-            await _random_delay(2.0, 6.0)
+            await _random_delay(1.0, 2.0)
 
+        # 5. Obtener CAPTCHA AHORA — después de todos los postbacks que pudieran
+        #    regenerar la imagen; así el texto corresponde al token actual.
+        self._log.info("Descargando y resolviendo CAPTCHA (tras configurar formulario)...")
+        image_bytes  = await self._get_captcha_image(page)
+        captcha_text = await self.captcha_client.solve(image_bytes)
+        self._log.info("CAPTCHA resuelto → '%s'", captcha_text)
+
+        self._log.debug("Escribiendo texto CAPTCHA: '%s'", captcha_text)
+        await _human_type(page, "#CodeTextBox", captcha_text)
+        await _random_delay(0.5, 1.5)
+
+        # 6. Submit y esperar respuesta
         self._log.debug("Enviando formulario (click en SearchSubmit)")
-        async with page.expect_navigation(wait_until="load", timeout=90000):
-            await _human_click(page, "#SearchSubmit")
-        self._log.debug("Navegación post-submit completada — URL: %s", page.url)
+        await _human_click(page, "#SearchSubmit")
+        self._log.debug("Esperando resultados o indicador de respuesta del servidor...")
+        try:
+            await page.wait_for_selector(
+                "tr:has(td > a[href*='CaseDetail']), "
+                "span.ErrorMessages, #lblError, "
+                "span[style*='color:red'], "
+                "td[colspan]:has-text('no')",
+                timeout=60000,
+            )
+        except Exception:
+            self._log.warning("Timeout esperando respuesta del servidor tras submit — continuando")
+        self._log.debug("Post-submit listo — URL: %s", page.url)
 
     async def _solve_cloudflare_challenge(self, page: Page) -> bool:
         """
@@ -1369,6 +1440,21 @@ class NDCourtsScraper:
         """
         self._log.debug("Parseando resultados — URL: %s", page.url)
 
+        # Esperar a que la página de resultados esté lista: bien aparecen filas con
+        # CaseDetail, bien un mensaje de "no matches" / "no cases found", bien el
+        # formulario con error de CAPTCHA. Si transcurren 30s sin ninguna de esas
+        # señales, continuar igualmente (no abortar).
+        try:
+            await page.wait_for_selector(
+                "tr:has(td > a[href*='CaseDetail']), "
+                "td[colspan]:has-text('no'), "
+                "span.ErrorMessages, #lblError, "
+                "span[style*='color:red']",
+                timeout=30000,
+            )
+        except Exception:
+            self._log.warning("Timeout esperando indicadores de resultado — continuando igualmente")
+
         # Detectar CAPTCHA incorrecto (el formulario vuelve a mostrarse con error)
         error_el = await page.query_selector(
             "span.ErrorMessages, .error, #lblError, span[style*='color:red']"
@@ -1394,7 +1480,12 @@ class NDCourtsScraper:
         self._log.debug("Filas de resultado encontradas: %d", len(rows))
 
         if not rows:
-            self._log.info("Sin resultados para la búsqueda")
+            # Loguear fragmento de HTML para diagnosticar qué hay en la página
+            body_snippet = await page.evaluate(
+                "() => document.body?.innerHTML?.slice(0, 2000) ?? '(vacío)'"
+            )
+            self._log.warning("Sin filas CaseDetail. HTML (primeros 2000 chars):\n%s", body_snippet)
+            await self._save_screenshot(page, "no_results")
             return []
 
         async def _divs(cell) -> list[str]:
@@ -1504,8 +1595,14 @@ class NDCourtsScraper:
             self._log.debug("Navegando a página %d (click en '%s')",
                             page_num + 1, await next_btn.inner_text())
             await _human_click_element(page, next_btn)
-            await page.wait_for_load_state("load")
-            await _random_delay(2.0, 6.0)
+            # Pager de ASP.NET también usa postback AJAX — esperar nuevas filas
+            try:
+                await page.wait_for_selector(
+                    "tr:has(td > a[href*='CaseDetail'])", timeout=30000
+                )
+            except Exception:
+                self._log.warning("Timeout esperando nueva página — continuando")
+            await _random_delay(2.0, 4.0)
             page_num += 1
 
         return all_results
@@ -1613,6 +1710,8 @@ class NDCourtsScraper:
 
                         self._log.info("[4/4] Rellenando formulario y enviando")
                         await self._fill_and_submit(search_page, params, captcha_text)
+                        # Espera extra para que la tabla de resultados termine de renderizar
+                        await _random_delay(4.0, 8.0)
 
                         results = await self._parse_results(search_page)
                         elapsed = time.monotonic() - t_total
@@ -1722,18 +1821,16 @@ class NDCourtsScraper:
 
                 await _random_delay(2.0, 6.0)
 
-                # 3-4. Bucle CAPTCHA + submit
+                # 3-4. Bucle submit (el CAPTCHA se resuelve dentro de _fill_date_field_search
+                #      después de hacer click en #DateFiled, para usar la imagen fresca)
                 for attempt in range(1, max_retries + 1):
-                    self._log.info("[3/4] Intento %d/%d — descargando y resolviendo CAPTCHA",
+                    self._log.info("[3/4] Intento %d/%d — rellenando formulario Date Field",
                                    attempt, max_retries)
                     t_attempt = time.monotonic()
 
                     try:
-                        image_bytes  = await self._get_captcha_image(search_page)
-                        captcha_text = await self.captcha_client.solve(image_bytes)
-
-                        self._log.info("[4/4] Rellenando formulario Date Field y enviando")
-                        await self._fill_date_field_search(search_page, params, captcha_text)
+                        self._log.info("[4/4] Enviando búsqueda por fecha")
+                        await self._fill_date_field_search(search_page, params)
 
                         all_results = await self._collect_all_pages(search_page)
                         elapsed = time.monotonic() - t_total
