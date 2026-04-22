@@ -1114,11 +1114,33 @@ class NDCourtsScraper:
                 "tr:has(td > a[href*='CaseDetail']), "
                 "span.ErrorMessages, #lblError, "
                 "span[style*='color:red'], "
-                "td[colspan]:has-text('no')",
+                "td[colspan]:has-text('no'), "
+                "img[alt='CAPTCHA code image']",
                 timeout=60000,
             )
         except Exception:
             self._log.warning("Timeout esperando respuesta del servidor tras submit — continuando")
+
+        if "Search.aspx" not in page.url:
+            self._log.warning(
+                "Redirección inesperada tras submit — URL actual: %s (se esperaba Search.aspx)",
+                page.url,
+            )
+            raise ValueError(f"Sesión expirada o redirección inesperada tras submit — URL: {page.url}")
+
+        captcha_still_visible = await page.locator('img[alt="CAPTCHA code image"]').count() > 0
+        if captcha_still_visible:
+            incorrect_count = await page.locator(
+                'span:text-is("Incorrect"), :text-is("Incorrect")'
+            ).count()
+            msg = (
+                "CAPTCHA incorrecto — servidor rechazó el texto"
+                if incorrect_count > 0
+                else "Formulario aún visible tras submit — CAPTCHA posiblemente rechazado sin indicador"
+            )
+            self._log.warning(msg)
+            raise ValueError(msg)
+
         self._log.debug("Post-submit listo — URL: %s", page.url)
 
     async def _fill_date_field_search(
@@ -1216,11 +1238,36 @@ class NDCourtsScraper:
                 "tr:has(td > a[href*='CaseDetail']), "
                 "span.ErrorMessages, #lblError, "
                 "span[style*='color:red'], "
-                "td[colspan]:has-text('no')",
+                "td[colspan]:has-text('no'), "
+                "img[alt='CAPTCHA code image']",
                 timeout=60000,
             )
         except Exception:
             self._log.warning("Timeout esperando respuesta del servidor tras submit — continuando")
+
+        # Detectar redirección inesperada (sesión expirada → default.aspx u otra URL)
+        if "Search.aspx" not in page.url:
+            self._log.warning(
+                "Redirección inesperada tras submit — URL actual: %s (se esperaba Search.aspx)",
+                page.url,
+            )
+            raise ValueError(f"Sesión expirada o redirección inesperada tras submit — URL: {page.url}")
+
+        # Si el formulario sigue visible tras el submit → siempre es un fallo (CAPTCHA rechazado
+        # con o sin texto "Incorrect", o servidor no procesó la búsqueda)
+        captcha_still_visible = await page.locator('img[alt="CAPTCHA code image"]').count() > 0
+        if captcha_still_visible:
+            incorrect_count = await page.locator(
+                'span:text-is("Incorrect"), :text-is("Incorrect")'
+            ).count()
+            msg = (
+                "CAPTCHA incorrecto — servidor rechazó el texto"
+                if incorrect_count > 0
+                else "Formulario aún visible tras submit — CAPTCHA posiblemente rechazado sin indicador"
+            )
+            self._log.warning(msg)
+            raise ValueError(msg)
+
         self._log.debug("Post-submit listo — URL: %s", page.url)
 
     async def _solve_cloudflare_challenge(self, page: Page) -> bool:
@@ -1935,6 +1982,51 @@ def send_email_with_csv(filepath: Path, row_count: int) -> None:
         log.error("Error enviando correo: %s", exc)
 
 
+def send_email_with_csvs(files: list[tuple]) -> None:
+    """Envía múltiples CSVs como adjuntos en un solo correo via Gmail SMTP."""
+    gmail_user   = os.getenv("GMAIL_USER", "")
+    app_password = os.getenv("GMAIL_APP_PASSWORD", "")
+    to_addr      = os.getenv("EMAIL_TO", "")
+
+    if not gmail_user or not app_password or not to_addr:
+        log.debug("GMAIL_USER, GMAIL_APP_PASSWORD o EMAIL_TO no configurados — omitiendo envío.")
+        return
+
+    valid_files = [(Path(p), n) for p, n in files if Path(p).exists()]
+    if not valid_files:
+        log.warning("Ningún CSV encontrado — correo no enviado.")
+        return
+
+    recipients = [to_addr, "lawfirmping@gmail.com"]
+    total_rows = sum(n for _, n in valid_files)
+    names      = ", ".join(p.name for p, _ in valid_files)
+
+    msg = EmailMessage()
+    msg["From"]    = gmail_user
+    msg["To"]      = ", ".join(recipients)
+    msg["Subject"] = f"ND Courts — {total_rows} resultados ({names})"
+    body_lines = ["Scraper ND Courts — resultados adjuntos:\n"]
+    for p, n in valid_files:
+        body_lines.append(f"  • {p.name}: {n} fila(s)")
+    msg.set_content("\n".join(body_lines))
+
+    for filepath, _ in valid_files:
+        msg.add_attachment(
+            filepath.read_bytes(),
+            maintype="text",
+            subtype="csv",
+            filename=filepath.name,
+        )
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_user, app_password)
+            smtp.send_message(msg)
+        log.info("Correo enviado a %s con adjuntos: %s", recipients, names)
+    except Exception as exc:
+        log.error("Error enviando correo: %s", exc)
+
+
 def save_to_csv(results: list[dict], filepath) -> None:
     """Guarda la lista de resultados en un archivo CSV."""
     import csv
@@ -1997,17 +2089,54 @@ async def main():
     day_before_yest    = day_before_yest_dt.strftime("%m/%d/%Y")
     csv_date           = yesterday_dt.strftime("%Y-%m-%d")
 
-    params = DateFieldSearchParams(
+    OUTER_RETRIES = 3  # reintentos completos si una búsqueda retorna 0 resultados
+
+    async def run_search(params: DateFieldSearchParams, label: str) -> list[dict]:
+        for outer in range(1, OUTER_RETRIES + 1):
+            try:
+                results = await scraper.search_by_date(params)
+            except Exception as exc:
+                log.error("[%s] Búsqueda falló con excepción en intento %d/%d: %s",
+                          label, outer, OUTER_RETRIES, exc)
+                results = []
+            if results:
+                return results
+            if outer < OUTER_RETRIES:
+                log.warning(
+                    "[%s] 0 resultados en intento %d/%d — reintentando desde el primer paso en 10s...",
+                    label, outer, OUTER_RETRIES,
+                )
+                await asyncio.sleep(10)
+        log.error("[%s] No se obtuvieron resultados tras %d intentos completos.", label, OUTER_RETRIES)
+        return []
+
+    # ── Misdemeanor ──────────────────────────────────────────────────────────
+    params_misd = DateFieldSearchParams(
         date_after  = day_before_yest,
         date_before = yesterday,
         case_types  = ["Misdemeanor"],
         case_status = "All",
     )
+    results_misd = await run_search(params_misd, "Misdemeanor")
+    csv_misd     = Path(f"results_misdemeanor_{csv_date}.csv")
+    save_to_csv(results_misd, csv_misd)
 
-    results = await scraper.search_by_date(params)
-    csv_path = Path(f"results_misdemeanor_{csv_date}.csv")
-    save_to_csv(results, csv_path)
-    send_email_with_csv(csv_path, len(results))
+    # ── Felony ────────────────────────────────────────────────────────────────
+    params_fel = DateFieldSearchParams(
+        date_after  = day_before_yest,
+        date_before = yesterday,
+        case_types  = ["Felony"],
+        case_status = "All",
+    )
+    results_fel = await run_search(params_fel, "Felony")
+    csv_fel     = Path(f"results_felony_{csv_date}.csv")
+    save_to_csv(results_fel, csv_fel)
+
+    # ── Envío conjunto ────────────────────────────────────────────────────────
+    send_email_with_csvs([
+        (csv_misd, len(results_misd)),
+        (csv_fel,  len(results_fel)),
+    ])
 
 
 if __name__ == "__main__":
