@@ -1,75 +1,132 @@
 # ND Courts Criminal/Traffic Scraper
 
-Este es un scraper robusto desarrollado en Python para el portal de búsqueda pública de los tribunales de Dakota del Norte (North Dakota Courts), específicamente diseñado para la sección de casos **Criminal/Traffic**.
+Scraper en Python para el portal de búsqueda pública de los tribunales de Dakota del Norte, diseñado para la sección **Criminal/Traffic**. Extrae casos por rango de fechas o por nombre de acusado, incluyendo dirección, cargos y abogado defensor desde las páginas de detalle.
 
-Utiliza **Playwright** para la automatización del navegador y soporta múltiples proveedores de servicios de resolución de CAPTCHA para sortear las protecciones de bot (LanAP Captcha y Cloudflare Turnstile).
+Usa **Playwright** para automatización del navegador y soporta múltiples proveedores de resolución de CAPTCHA (LanAP + Cloudflare Turnstile).
 
-## 🚀 Características
+## Características
 
-- **Automatización con Playwright:** Navegación real en navegador Chromium.
-- **Soporte Multi-Proveedor CAPTCHA:** Compatible con 2captcha, SolveCaptcha y CapSolver.
-- **Bypass de Cloudflare:** Maneja desafíos de Turnstile mediante integración con solvers.
-- **Técnicas Anti-Detección:** Uso de scripts de sigilo (stealth), User-Agents aleatorios y simulación de comportamiento humano (tiempos de espera y movimientos de ratón).
-- **Depuración:** Captura automática de capturas de pantalla en caso de error en la carpeta `debug_screenshots/`.
+- **Búsqueda por fecha (modo principal):** Extrae todos los casos de un rango de fechas sin requerir nombre; recorre automáticamente todas las páginas de resultados.
+- **Búsqueda por nombre:** Modo Defendant con apellido, nombre, DOB, soundex, rango de fechas y tipo de caso.
+- **Enriquecimiento de datos:** Cada resultado se enriquece automáticamente con City, State, Zip, Attorney y Charges detallados desde `CaseDetail.aspx`.
+- **Soporte multi-proveedor CAPTCHA:** Compatible con 2captcha, SolveCaptcha y CapSolver.
+- **Preprocesamiento de imagen CAPTCHA:** Escalado 3×, escala de grises, blur y binarización para mejorar la precisión del OCR.
+- **Bypass de Cloudflare:** Maneja Turnstile Managed Challenge; espera auto-resolución (20s) y cae en CAPTCHA API como fallback.
+- **Stealth multi-capa:** Soporte para camoufox (Firefox), rebrowser-playwright y playwright-stealth. Fallback a script manual mínimo.
+- **Paginación automática:** Navega el GridView ASP.NET recorriendo todos los botones ">" del pager.
+- **Notificaciones por email:** Envía los CSVs resultantes por Gmail SMTP al finalizar.
+- **Reintentos robustos:** Reintentos internos de CAPTCHA + reintentos externos completos si se obtienen 0 resultados.
+- **Anti-detección:** User-Agents aleatorios, viewports variables, movimientos de ratón Bezier, delays humanos, scroll simulado.
+- **Proxy residencial:** Soporte con proxy local que pre-embebe credenciales (resuelve incompatibilidad Chromium con auth en dos pasos).
+- **Depuración:** Screenshots automáticos en `debug_screenshots/` ante cualquier fallo, incluyendo imagen CAPTCHA raw y preprocesada.
 
-## 📋 Requisitos Previos
+## Requisitos Previos
 
 - Python 3.10 o superior.
-- Una cuenta y API Key en uno de los proveedores soportados (2captcha, SolveCaptcha o CapSolver).
+- API Key de un proveedor CAPTCHA soportado (2captcha, SolveCaptcha o CapSolver).
+- Para email: cuenta Gmail con App Password configurada.
+- Para proxy: proxies residenciales (datacenter bloqueado por Cloudflare). Webshare Rotating Residential confirmado.
 
-## 🛠️ Instalación
+## Instalación
 
-1.  **Clonar el repositorio** (o descargar los archivos).
-2.  **Crear y activar un entorno virtual:**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # En Windows: venv\Scripts\activate
-    ```
-3.  **Instalar las dependencias:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-4.  **Instalar el navegador necesario (Chromium):**
-    ```bash
-    playwright install chromium
-    ```
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+```
 
-## 📖 Uso
+Mejoras de stealth opcionales (cualquier combinación):
+```bash
+pip install camoufox            # Recomendado — Firefox stealth, mejor evasión Cloudflare
+pip install rebrowser-playwright
+pip install playwright-stealth
+```
 
-1.  **Configurar las variables de entorno:**
-    Copia el archivo de ejemplo y edítalo con tus claves:
-    ```bash
-    cp .env.example .env
-    ```
-    Edita `.env` y configura tu API Key y el proveedor preferido:
-    - `TWOCAPTCHA_API_KEY`
-    - `SOLVECAPTCHA_API_KEY`
-    - `CAPSOLVER_API_KEY`
-    - `CAPTCHA_PROVIDER` (opciones: `2captcha`, `solvecaptcha`, `capsolver`)
-    - `HEADLESS` (opcional: `true` para ejecución en segundo plano, `false` para ver el navegador)
+## Configuración
 
-3.  **Configuración de Proxy (Opcional):**
-    Si necesitas usar un proxy, configura las siguientes variables en `.env`:
-    - `PROXY_SERVER`: Dirección del servidor (ej: `http://mi-proxy:8080` o `socks5://host:1080`)
-    - `PROXY_USERNAME`: Usuario del proxy (si requiere autenticación)
-    - `PROXY_PASSWORD`: Contraseña del proxy
-    - `PROXY_BYPASS`: Dominios que no deben usar el proxy (separados por comas)
+Crea un archivo `.env` en la raíz del proyecto:
 
-4.  **Ejecutar el scraper:**
-    ```bash
-    python scraper.py
-    ```
+```env
+# CAPTCHA — elige un proveedor y su clave
+CAPTCHA_PROVIDER=2captcha       # opciones: 2captcha | solvecaptcha | capsolver
+TWOCAPTCHA_API_KEY=xxx
+SOLVECAPTCHA_API_KEY=xxx
+CAPSOLVER_API_KEY=CAP-xxx
 
-### Configuración avanzada
-Puedes seguir pasando parámetros directamente al constructor si lo prefieres, pero el script `main()` ahora prioriza lo definido en el archivo `.env`.
+# Navegador
+HEADLESS=true                   # false para ver el navegador (útil para depurar)
 
-## 📂 Estructura del Proyecto
+# Proxy residencial (opcional pero recomendado)
+PROXY_SERVER=http://p.webshare.io:80
+PROXY_USERNAME=tu_usuario
+PROXY_PASSWORD=tu_contraseña
 
-- `scraper.py`: Archivo principal que contiene toda la lógica del scraper y los clientes de CAPTCHA.
-- `requirements.txt`: Librerías de Python necesarias.
-- `CLAUDE.md` / `GEMINI.md`: Guías técnicas y de arquitectura para asistentes de IA.
-- `debug_screenshots/`: Directorio donde se guardan evidencias de errores durante la ejecución.
+# Email (opcional — omitir si no se necesita)
+GMAIL_USER=tu_cuenta@gmail.com
+GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
+EMAIL_TO=destinatario@ejemplo.com
+```
 
-## ⚠️ Aviso Legal
+## Uso
+
+### Modo automático (misdemeanor + felony del día anterior)
+
+```bash
+python scraper.py
+# o
+bash run_scraper.sh
+```
+
+Ejecuta dos búsquedas por fecha (Misdemeanor y Felony para el día anterior), guarda los CSVs y los envía por email.
+
+### Uso programático
+
+```python
+import asyncio
+from scraper import NDCourtsScraper, DateFieldSearchParams, SearchParams, save_to_csv
+
+scraper = NDCourtsScraper(api_key="xxx", provider="2captcha", headless=True)
+
+# Búsqueda por fecha (modo principal)
+params = DateFieldSearchParams(
+    date_after  = "04/20/2026",
+    date_before = "04/21/2026",
+    case_types  = ["Misdemeanor"],   # o ["Felony"], o [] para todos
+    case_status = "All",
+)
+results = asyncio.run(scraper.search_by_date(params))
+save_to_csv(results, "output.csv")
+
+# Búsqueda por nombre
+params_name = SearchParams(
+    last_name  = "Smith",
+    first_name = "John",
+    case_types = ["Misdemeanor"],
+)
+results = asyncio.run(scraper.search(params_name))
+```
+
+### Enriquecimiento retroactivo de CSV
+
+`enrich_csv.py` es una herramienta independiente para añadir City/State/Zip/Attorney/Charges a un CSV existente. Configura `CSV_FILE` y `SEARCH_HTML` al inicio del archivo, luego:
+
+```bash
+python enrich_csv.py
+```
+
+## Estructura del Proyecto
+
+```
+scraper.py          # Scraper principal — toda la lógica de búsqueda, CAPTCHA, parseo y email
+enrich_csv.py       # Herramienta de enriquecimiento retroactivo de CSVs
+run_scraper.sh      # Script shell (activa venv y ejecuta scraper.py)
+requirements.txt    # Dependencias Python
+CLAUDE.md           # Guía técnica de arquitectura para Claude Code
+GEMINI.md           # Guía técnica para Gemini
+debug_screenshots/  # Screenshots de error y CAPTCHAs (generados automáticamente)
+```
+
+## Aviso Legal
 
 Este proyecto tiene fines educativos y de investigación. El scraping de sitios web públicos debe realizarse respetando los términos de servicio del sitio objetivo y las leyes de privacidad aplicables. El autor no se hace responsable del uso indebido de esta herramienta.
