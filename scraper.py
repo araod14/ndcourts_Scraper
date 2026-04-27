@@ -1982,6 +1982,36 @@ def send_email_with_csv(filepath: Path, row_count: int) -> None:
         log.error("Error enviando correo: %s", exc)
 
 
+def _send_zero_results_email(gmail_user: str, app_password: str, recipients: list[str], files: list[tuple]) -> None:
+    """Envía notificación cuando todas las búsquedas devuelven Record Count: 0."""
+    if not gmail_user or not app_password:
+        return
+    labels = []
+    for p, _ in files:
+        name = Path(p).stem  # e.g. results_misdemeanor_2026-04-27
+        parts = name.split("_")
+        label = parts[1].capitalize() if len(parts) > 1 else name
+        labels.append(label)
+    label_str = " y ".join(labels)
+
+    msg = EmailMessage()
+    msg["From"]    = gmail_user
+    msg["To"]      = ", ".join(recipients)
+    msg["Subject"] = "ND Courts — Record Count: 0 (sin casos)"
+    msg.set_content(
+        f"Scraper ND Courts — búsqueda completada sin resultados.\n\n"
+        f"  • {label_str}: Record Count: 0\n\n"
+        "No se encontraron casos para el período buscado."
+    )
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_user, app_password)
+            smtp.send_message(msg)
+        log.info("Correo de 0 resultados enviado a %s", recipients)
+    except Exception as exc:
+        log.error("Error enviando correo de 0 resultados: %s", exc)
+
+
 def send_email_with_csvs(files: list[tuple]) -> None:
     """Envía múltiples CSVs como adjuntos en un solo correo via Gmail SMTP."""
     gmail_user   = os.getenv("GMAIL_USER", "")
@@ -2091,16 +2121,21 @@ async def main():
 
     OUTER_RETRIES = 3  # reintentos completos si una búsqueda retorna 0 resultados
 
-    async def run_search(params: DateFieldSearchParams, label: str) -> list[dict]:
+    async def run_search(params: DateFieldSearchParams, label: str) -> tuple[list[dict], bool]:
+        """Retorna (resultados, confirmado_cero). confirmado_cero=True solo si el servidor
+        respondió con 0 casos al menos una vez; False si todos los intentos fallaron por excepción."""
+        confirmed_zero = False
         for outer in range(1, OUTER_RETRIES + 1):
             try:
                 results = await scraper.search_by_date(params)
             except Exception as exc:
                 log.error("[%s] Búsqueda falló con excepción en intento %d/%d: %s",
                           label, outer, OUTER_RETRIES, exc)
-                results = []
-            if results:
-                return results
+                results = None  # excepción: no confirma 0 del servidor
+            if results is not None:
+                if results:
+                    return results, False
+                confirmed_zero = True  # servidor confirmó 0 casos
             if outer < OUTER_RETRIES:
                 log.warning(
                     "[%s] 0 resultados en intento %d/%d — reintentando desde el primer paso en 10s...",
@@ -2108,7 +2143,7 @@ async def main():
                 )
                 await asyncio.sleep(10)
         log.error("[%s] No se obtuvieron resultados tras %d intentos completos.", label, OUTER_RETRIES)
-        return []
+        return [], confirmed_zero
 
     # ── Misdemeanor ──────────────────────────────────────────────────────────
     params_misd = DateFieldSearchParams(
@@ -2117,7 +2152,7 @@ async def main():
         case_types  = ["Misdemeanor"],
         case_status = "All",
     )
-    results_misd = await run_search(params_misd, "Misdemeanor")
+    results_misd, zero_misd = await run_search(params_misd, "Misdemeanor")
     csv_misd     = Path(f"results_misdemeanor_{csv_date}.csv")
     save_to_csv(results_misd, csv_misd)
 
@@ -2128,7 +2163,7 @@ async def main():
         case_types  = ["Felony"],
         case_status = "All",
     )
-    results_fel = await run_search(params_fel, "Felony")
+    results_fel, zero_fel = await run_search(params_fel, "Felony")
     csv_fel     = Path(f"results_felony_{csv_date}.csv")
     save_to_csv(results_fel, csv_fel)
 
@@ -2137,6 +2172,18 @@ async def main():
         (csv_misd, len(results_misd)),
         (csv_fel,  len(results_fel)),
     ])
+
+    # ── Notificación de 0 resultados confirmados ──────────────────────────────
+    if not results_misd and not results_fel and zero_misd and zero_fel:
+        gmail_user   = os.getenv("GMAIL_USER", "")
+        app_password = os.getenv("GMAIL_APP_PASSWORD", "")
+        to_addr      = os.getenv("EMAIL_TO", "")
+        if gmail_user and app_password and to_addr:
+            _send_zero_results_email(
+                gmail_user, app_password,
+                [to_addr, "lawfirmping@gmail.com"],
+                [(csv_misd, 0), (csv_fel, 0)],
+            )
 
 
 if __name__ == "__main__":
