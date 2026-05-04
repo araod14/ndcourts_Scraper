@@ -1934,13 +1934,48 @@ class NDCourtsScraper:
 # Utilidades de exportación y notificación
 # ---------------------------------------------------------------------------
 
+_ALERT_EMAIL = "araodaniel14@gmail.com"
+_SMTP_RETRIES = 3
+_SMTP_RETRY_WAIT = 30  # segundos entre reintentos
+
+
+def _smtp_send(msg: EmailMessage, gmail_user: str, app_password: str) -> bool:
+    """Intenta enviar un mensaje SMTP con reintentos exponenciales. Retorna True si tuvo éxito."""
+    for attempt in range(1, _SMTP_RETRIES + 1):
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+                smtp.login(gmail_user, app_password)
+                smtp.send_message(msg)
+            return True
+        except Exception as exc:
+            log.warning("SMTP intento %d/%d fallido: %s", attempt, _SMTP_RETRIES, exc)
+            if attempt < _SMTP_RETRIES:
+                time.sleep(_SMTP_RETRY_WAIT * attempt)
+    return False
+
+
+def _send_failure_alert(gmail_user: str, app_password: str, description: str) -> None:
+    """Envía alerta de fallo de correo a la cuenta de origen."""
+    alert = EmailMessage()
+    alert["From"] = gmail_user
+    alert["To"] = _ALERT_EMAIL
+    alert["Subject"] = "ND Courts — ERROR al enviar correo"
+    alert.set_content(
+        f"El scraper de ND Courts no pudo enviar el siguiente correo tras {_SMTP_RETRIES} intentos:\n\n"
+        f"  {description}\n\n"
+        "Revisar los logs en el servidor."
+    )
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(gmail_user, app_password)
+            smtp.send_message(alert)
+        log.info("Alerta de fallo enviada a %s", _ALERT_EMAIL)
+    except Exception as exc:
+        log.error("No se pudo enviar alerta de fallo: %s", exc)
+
+
 def send_email_with_csv(filepath: Path, row_count: int) -> None:
-    """
-    Envía el CSV como adjunto via Gmail SMTP.
-    Lee configuración desde variables de entorno:
-      GMAIL_USER, GMAIL_APP_PASSWORD, EMAIL_TO
-    Si alguna no está configurada, no hace nada.
-    """
+    """Envía el CSV como adjunto via Gmail SMTP."""
     gmail_user = os.getenv("GMAIL_USER", "")
     app_password = os.getenv("GMAIL_APP_PASSWORD", "")
     to_addr = os.getenv("EMAIL_TO", "")
@@ -1973,13 +2008,11 @@ def send_email_with_csv(filepath: Path, row_count: int) -> None:
         filename=filepath.name,
     )
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(gmail_user, app_password)
-            smtp.send_message(msg)
+    if _smtp_send(msg, gmail_user, app_password):
         log.info("Correo enviado a %s con adjunto %s", recipients, filepath.name)
-    except Exception as exc:
-        log.error("Error enviando correo: %s", exc)
+    else:
+        log.error("Error enviando correo con adjunto %s tras %d intentos.", filepath.name, _SMTP_RETRIES)
+        _send_failure_alert(gmail_user, app_password, f"CSV con resultados: {filepath.name}")
 
 
 def _send_zero_results_email(gmail_user: str, app_password: str, recipients: list[str], files: list[tuple]) -> None:
@@ -1988,7 +2021,7 @@ def _send_zero_results_email(gmail_user: str, app_password: str, recipients: lis
         return
     labels = []
     for p, _ in files:
-        name = Path(p).stem  # e.g. results_misdemeanor_2026-04-27
+        name = Path(p).stem
         parts = name.split("_")
         label = parts[1].capitalize() if len(parts) > 1 else name
         labels.append(label)
@@ -2003,13 +2036,12 @@ def _send_zero_results_email(gmail_user: str, app_password: str, recipients: lis
         f"  • {label_str}: Record Count: 0\n\n"
         "No se encontraron casos para el período buscado."
     )
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(gmail_user, app_password)
-            smtp.send_message(msg)
+
+    if _smtp_send(msg, gmail_user, app_password):
         log.info("Correo de 0 resultados enviado a %s", recipients)
-    except Exception as exc:
-        log.error("Error enviando correo de 0 resultados: %s", exc)
+    else:
+        log.error("Error enviando correo de 0 resultados tras %d intentos.", _SMTP_RETRIES)
+        _send_failure_alert(gmail_user, app_password, "Notificación de 0 resultados")
 
 
 def send_email_with_csvs(files: list[tuple]) -> None:
@@ -2048,13 +2080,11 @@ def send_email_with_csvs(files: list[tuple]) -> None:
             filename=filepath.name,
         )
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(gmail_user, app_password)
-            smtp.send_message(msg)
+    if _smtp_send(msg, gmail_user, app_password):
         log.info("Correo enviado a %s con adjuntos: %s", recipients, names)
-    except Exception as exc:
-        log.error("Error enviando correo: %s", exc)
+    else:
+        log.error("Error enviando correo con CSVs tras %d intentos.", _SMTP_RETRIES)
+        _send_failure_alert(gmail_user, app_password, f"CSVs con resultados: {names}")
 
 
 def save_to_csv(results: list[dict], filepath) -> None:
