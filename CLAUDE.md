@@ -22,11 +22,22 @@ pip install playwright-stealth  # Extra fingerprint overrides for Chromium
 
 ```bash
 source venv/bin/activate
-python scraper.py          # Runs yesterday's Misdemeanor + Felony searches and emails results
-bash run_scraper.sh        # Wrapper script (activates venv, runs scraper.py)
+python scraper.py          # Runs day-before-yesterday → yesterday searches (Misdemeanor + Felony) and emails results
+bash run_scraper.sh        # Production wrapper: random 0-60 min delay + xvfb-run (requires Xvfb on server)
 ```
 
 Configure via `.env` (see below). Use `HEADLESS=false` to watch the browser while debugging.
+
+**Server deployment note:** `run_scraper.sh` uses `xvfb-run` for a virtual framebuffer — required when running on a headless server without a display. Install with `sudo apt install xvfb`. The script also adds a random 0–3600 s delay so cron jobs land anywhere in the target window.
+
+## Running tests
+
+```bash
+source venv/bin/activate
+pytest test_csv_generation.py -v
+```
+
+Tests use local HTML files (`Search.aspx.html`, `CaseDetail.html`) as mocks — no browser or CAPTCHA required. They verify CSV column structure, row count (200 rows from the mock), name/address/charge parsing, and file roundtrip correctness.
 
 ## Architecture
 
@@ -40,7 +51,7 @@ Single-file scraper (`scraper.py`) targeting `https://publicsearch.ndcourts.gov/
 5. Sends CAPTCHA image to configured provider; polls until resolved; writes text into `#CodeTextBox`
 6. After submit, `_collect_all_pages()` walks the ASP.NET GridView pager collecting all result pages
 7. Each result row triggers `_fetch_detail()` to pull address/attorney/charges from `CaseDetail.aspx`
-8. `main()` wraps each `search_by_date()` call in an outer retry loop (up to 3 full re-runs if 0 results); emails both CSVs via `send_email_with_csvs()`
+8. `main()` wraps each `search_by_date()` call in an outer retry loop (up to 3 full re-runs if 0 results); emails both CSVs via `send_email_with_csvs()`. Date range is always `day_before_yesterday → yesterday` (two-day window). Output CSVs: `results_misdemeanor_<YYYY-MM-DD>.csv` / `results_felony_<YYYY-MM-DD>.csv`. All output logged to `ndcourts.log`.
 
 **Flow (search — by-name mode):**
 Same steps 1–3, then `_fill_and_submit()` fills the Defendant search form (CAPTCHA solved first, before any form interaction).
@@ -60,7 +71,8 @@ Same steps 1–3, then `_fill_and_submit()` fills the Defendant search form (CAP
   - `_collect_all_pages(page)` — walks ASP.NET GridView pager (">", ">>", "Next" links)
   - `_fetch_detail(page, url)` / `_parse_detail_html(html)` — enriches each row with CaseDetail data
   - `_attach_console_listener(page)` — forwards browser console messages to the logger
-- `send_email_with_csvs(files)` — emails multiple CSVs as attachments via Gmail SMTP
+- `send_email_with_csvs(files)` — emails multiple CSVs via Gmail SMTP; `files` is `list[tuple[Path, int]]` (filepath, row_count). Always CC'd to `lawfirmping@gmail.com`. On SMTP failure, sends a failure alert to the hardcoded `_ALERT_EMAIL = "araodaniel14@gmail.com"`.
+- `_send_zero_results_email(...)` — sends a special "0 results" notification when both searches return confirmed empty (server responded, not exception)
 - `save_to_csv(results, filepath)` — writes results list to CSV
 
 **Supplementary script:**
@@ -101,6 +113,7 @@ NDCourtsScraper(api_key="", solver=my_custom_solver)
 PROXY_SERVER=http://p.webshare.io:80
 PROXY_USERNAME=your_username
 PROXY_PASSWORD=your_password
+PROXY_BYPASS=                     # optional: comma-separated domains to skip proxy
 ```
 - Requires **residential proxies** — datacenter IPs are hard-blocked by Cloudflare on this site
 - `publicsearch.ndcourts.gov` is a `.gov` domain; IProyal requires $500 spend to unlock `.gov` on residential plans

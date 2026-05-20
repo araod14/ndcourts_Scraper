@@ -2215,6 +2215,9 @@ async def main():
                 [(csv_misd, 0), (csv_fel, 0)],
             )
 
+    if not results_misd and not results_fel:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
